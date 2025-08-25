@@ -1,0 +1,158 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+
+def run_modified_mean_reversion_backtest():
+    """
+    Executa o backtest para a estratégia de Reversão à Média com a lógica de
+    saída quando o Z-Score retorna a zero. Inclui operações de compra e venda (short).
+    """
+    print("--- INICIANDO BACKTEST DA ESTRATÉGIA MODIFICADA (SAÍDA NA MÉDIA) ---")
+
+    # ETAPA 1: CARREGAMENTO E TRATAMENTO DOS DADOS (sem alterações)
+    print("\n[ETAPA 1/4] Carregando e tratando os dados...")
+    try:
+        df_acoes = pd.read_csv('precos_b3_202010-2024.csv', index_col='Date', parse_dates=True)
+        df_ibov = pd.read_csv('ibov_2010_2024.csv', index_col='Date', parse_dates=True)
+        # O tratamento dos dados seria feito aqui, mas vamos carregar o arquivo já tratado
+        df_precos = pd.read_csv('dados_tratados.csv', index_col='Date', parse_dates=True)
+        df_zscores = pd.read_csv('zscores.csv', index_col='Date', parse_dates=True)
+    except FileNotFoundError:
+        print("ERRO: Certifique-se que os arquivos 'dados_tratados.csv' e 'zscores.csv' estão na mesma pasta.")
+        return
+    print("Dados carregados com sucesso.")
+
+    # ETAPA 2: SIMULAÇÃO DO BACKTEST COM A NOVA LÓGICA
+    print("\n[ETAPA 2/4] Executando a simulação com a nova lógica de saída...")
+    
+    # Parâmetros
+    INITIAL_CAPITAL = 1000000.00
+    POSITION_SIZE = 50000.00 # Alocação por operação (long ou short)
+    Z_EXIT = 0.0 # Ponto de saída
+    tickers_acoes = [col for col in df_precos.columns if col != 'IBOV']
+
+    # Estruturas de Dados
+    cash = INITIAL_CAPITAL
+    positions = {ticker: {'type': 'none', 'shares': 0, 'entry_price': 0} for ticker in tickers_acoes}
+    portfolio_history = []
+    
+    # Loop de Simulação
+    for i in range(len(df_precos)):
+        date = df_precos.index[i]
+        
+        # 1. Calcular valor atual do portfólio
+        current_positions_value = 0
+        for ticker in tickers_acoes:
+            if positions[ticker]['type'] != 'none':
+                current_price = df_precos[ticker].iloc[i]
+                
+                if positions[ticker]['type'] == 'long':
+                    current_positions_value += positions[ticker]['shares'] * current_price
+                elif positions[ticker]['type'] == 'short':
+                    # O valor de uma posição vendida é o caixa recebido na venda menos o custo atual de recompra
+                    entry_value = positions[ticker]['shares'] * positions[ticker]['entry_price']
+                    current_cost = positions[ticker]['shares'] * current_price
+                    current_positions_value += (entry_value - current_cost)
+
+        total_portfolio_value = cash + current_positions_value
+        portfolio_history.append({'Date': date, 'Portfolio_Value': total_portfolio_value})
+
+        # 2. Lógica de Entrada e Saída
+        z_scores_today = df_zscores.iloc[i]
+        
+        for ticker in tickers_acoes:
+            z = z_scores_today[ticker]
+            if pd.isna(z): continue
+
+            current_price = df_precos[ticker].iloc[i]
+            
+            # Lógica de Saída
+            if positions[ticker]['type'] == 'long' and z >= Z_EXIT:
+                cash += positions[ticker]['shares'] * current_price
+                positions[ticker] = {'type': 'none', 'shares': 0, 'entry_price': 0}
+            elif positions[ticker]['type'] == 'short' and z <= Z_EXIT:
+                cost_to_cover = positions[ticker]['shares'] * current_price
+                cash -= cost_to_cover
+                positions[ticker] = {'type': 'none', 'shares': 0, 'entry_price': 0}
+
+            # Lógica de Entrada
+            if positions[ticker]['type'] == 'none':
+                if z < -2.0 and cash >= POSITION_SIZE:
+                    shares_to_buy = POSITION_SIZE / current_price
+                    positions[ticker] = {'type': 'long', 'shares': shares_to_buy, 'entry_price': current_price}
+                    cash -= POSITION_SIZE
+                elif z > 2.0 and cash >= POSITION_SIZE: # Assumindo margem igual ao valor da posição
+                    shares_to_sell = POSITION_SIZE / current_price
+                    positions[ticker] = {'type': 'short', 'shares': shares_to_sell, 'entry_price': current_price}
+                    cash += POSITION_SIZE # Recebe o caixa da venda a descoberto
+    
+    df_portfolio = pd.DataFrame(portfolio_history).set_index('Date')
+    print("Simulação concluída.")
+
+    # ETAPA 3: CÁLCULO DAS MÉTRICAS DE PERFORMANCE
+    print("\n[ETAPA 3/4] Calculando métricas de performance...")
+    df_results = calculate_performance_metrics(df_portfolio, df_precos, INITIAL_CAPITAL)
+    print("\n--- MÉTRICAS DE PERFORMANCE (ESTRATÉGIA MODIFICADA) ---")
+    print(df_results)
+
+    # ETAPA 4: VISUALIZAÇÃO DOS RESULTADOS
+    print("\n[ETAPA 4/4] Gerando gráfico da Curva de Capital...")
+    plot_equity_curve(df_portfolio, df_precos, INITIAL_CAPITAL)
+    print("\n--- BACKTEST MODIFICADO CONCLUÍDO ---")
+
+
+def calculate_performance_metrics(df_portfolio, df_precos, initial_capital):
+    # Preparar DataFrames de retornos
+    df_portfolio['Daily_Return'] = df_portfolio['Portfolio_Value'].pct_change()
+    df_precos['IBOV_Daily_Return'] = df_precos['IBOV'].pct_change()
+
+    # Métricas da Estratégia
+    total_return_strategy = (df_portfolio['Portfolio_Value'].iloc[-1] / initial_capital) - 1
+    annual_return_strategy = (1 + total_return_strategy) ** (252 / len(df_portfolio)) - 1
+    annual_volatility_strategy = df_portfolio['Daily_Return'].std() * np.sqrt(252)
+    sharpe_ratio_strategy = annual_return_strategy / annual_volatility_strategy if annual_volatility_strategy != 0 else 0
+    
+    portfolio_cum_return = (1 + df_portfolio['Daily_Return']).cumprod()
+    portfolio_peak = portfolio_cum_return.cummax()
+    portfolio_drawdown = (portfolio_cum_return - portfolio_peak) / portfolio_peak
+    max_drawdown_strategy = portfolio_drawdown.min()
+
+    # Métricas do IBOV
+    total_return_ibov = (df_precos['IBOV'].iloc[-1] / df_precos['IBOV'].iloc[0]) - 1
+    annual_return_ibov = (1 + total_return_ibov) ** (252 / len(df_precos)) - 1
+    annual_volatility_ibov = df_precos['IBOV_Daily_Return'].std() * np.sqrt(252)
+    sharpe_ratio_ibov = annual_return_ibov / annual_volatility_ibov if annual_volatility_ibov != 0 else 0
+    
+    ibov_cum_return = (1 + df_precos['IBOV_Daily_Return']).cumprod()
+    ibov_peak = ibov_cum_return.cummax()
+    ibov_drawdown = (ibov_cum_return - ibov_peak) / ibov_peak
+    max_drawdown_ibov = ibov_drawdown.min()
+
+    results = {
+        "Métrica": ["Rentabilidade Total", "Retorno Anualizado", "Volatilidade Anualizada", "Índice de Sharpe", "Drawdown Máximo"],
+        "Estratégia": [f"{total_return_strategy:.2%}", f"{annual_return_strategy:.2%}", f"{annual_volatility_strategy:.2%}", f"{sharpe_ratio_strategy:.2f}", f"{max_drawdown_strategy:.2%}"],
+        "IBOV": [f"{total_return_ibov:.2%}", f"{annual_return_ibov:.2%}", f"{annual_volatility_ibov:.2%}", f"{sharpe_ratio_ibov:.2f}", f"{max_drawdown_ibov:.2%}"]
+    }
+    return pd.DataFrame(results)
+
+def plot_equity_curve(df_portfolio, df_precos, initial_capital):
+    df_portfolio['Portfolio_Return_Base100'] = (df_portfolio['Portfolio_Value'] / initial_capital) * 100
+    df_precos['IBOV_Return_Base100'] = (df_precos['IBOV'] / df_precos['IBOV'].iloc[0]) * 100
+
+    plt.style.use('seaborn-v0_8-darkgrid')
+    fig, ax = plt.subplots(figsize=(14, 8))
+    ax.plot(df_portfolio.index, df_portfolio['Portfolio_Return_Base100'], label='Estratégia Modificada (Saída na Média)', color='green', linewidth=2)
+    ax.plot(df_precos.index, df_precos['IBOV_Return_Base100'], label='IBOV (Benchmark)', color='darkorange', linewidth=2, linestyle='--')
+
+    ax.set_title('Curva de Capital da Estratégia Modificada (2010-2024)', fontsize=16, fontweight='bold')
+    ax.set_xlabel('Ano', fontsize=12)
+    ax.set_ylabel('Crescimento do Capital (Base 100)', fontsize=12)
+    ax.legend(fontsize=12)
+    plt.xticks(rotation=45, ha='right')
+    plt.tight_layout()
+    plt.savefig('equity_curve_modificada.png', dpi=300)
+    print("Gráfico 'equity_curve_modificada.png' salvo com sucesso!")
+
+if __name__ == '__main__':
+    run_modified_mean_reversion_backtest()
